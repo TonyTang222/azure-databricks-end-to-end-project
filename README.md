@@ -160,8 +160,3 @@ Create a multi-task Databricks Job:
 - Path mismatches: Update storage account/container names in notebooks to match your environment.
 - Auto Loader schema evolution: If schema drifts, update `schemaLocation` and consider options for evolution.
 - DLT pipeline errors: Ensure the DLT permissions, target UC settings, and that `Gold Products.ipynb` is used as the pipeline notebook.
-
-
-## License
-
-This project is provided as-is for educational purposes.
