@@ -1,162 +1,114 @@
-### Azure Databricks End-to-End Project (Bronze → Silver → Gold)
+# Azure Databricks Data Lakehouse Pipeline
 
-This project demonstrates an end-to-end lakehouse pipeline on Azure Databricks using Delta Lake, Unity Catalog, and ABFSS-backed storage. It covers:
+End-to-end lakehouse pipeline on Azure Databricks that ingests raw data via Auto Loader,
+transforms through Medallion Architecture (Bronze → Silver → Gold), and builds a Star Schema
+dimensional model with SCD Type 1 & 2 — governed by Unity Catalog.
 
-- **Bronze**: Streaming ingestion from `abfss://source@...` to `abfss://bronze@...`
-- **Silver**: Cleansed, curated Delta tables for `customers`, `orders`, `products`, and `regions`
-- **Gold**: Dimensional models
-  - `DimCustomers` with SCD Type 1 merge
-  - `DimProducts` using a DLT pipeline with expectations and SCD2 via `apply_changes`
-  - `FactOrders` upserted from Silver and joined to dimensions
+## Architecture
 
+```
+ADLS Gen2 (Source)                    Unity Catalog
+ ┌──────────┐                     ┌──────────────────┐
+ │ Parquet   │                     │ databricks_catalog│
+ │ files     │                     │ ├── bronze       │
+ └─────┬─────┘                     │ ├── silver       │
+       │                           │ └── gold         │
+       ▼                           └──────────────────┘
+┌──────────────────┐    ┌──────────────┐    ┌──────────────────────────────┐
+│      Bronze      │───▶│    Silver    │───▶│            Gold              │
+│   Auto Loader    │    │  Cleanse &   │    │                              │
+│   (Streaming)    │    │  Transform   │    │  DimCustomers (SCD1, MERGE)  │
+│                  │    │              │    │  DimProducts  (SCD2, DLT)    │
+│ checkpoint       │    │  customers   │    │  FactOrders   (MERGE)        │
+│ schema evolution │    │  orders      │    │                              │
+│                  │    │  products    │    │  Optimizations:              │
+│                  │    │  regions     │    │  broadcast / partition /     │
+│                  │    │              │    │  Z-ORDER / column pruning    │
+└──────────────────┘    └──────────────┘    └──────────────────────────────┘
+   ADLS bronze        ADLS silver              ADLS gold
+   (Parquet)          (Delta Lake)             (Delta Lake)
+```
 
-## Prerequisites
+**Orchestration:**
 
-- Azure Databricks workspace with Unity Catalog enabled
-- DBR runtime with Delta Lake support (e.g., 13.x+)
-- Azure Data Lake Storage (ADLS) Gen2 account containing these containers:
-  - `source`, `bronze`, `silver`, `gold`
-- The notebooks assume a storage account host of `databricksstorage222.dfs.core.windows.net`. Adjust paths if yours differs.
-- Unity Catalog objects (catalog and schemas) referenced by the notebooks:
-  - Catalog: `databricks_catalog`
-  - Schemas: `bronze`, `silver`, `gold`
-  - Ensure the schemas exist and your cluster is UC-enabled with permissions to read/write.
+![Databricks Workflows DAG](workflows.png)
 
+```
+parameters.ipynb → [output_datasets via task values]
+       │
+       ├── Bronze_Layer.ipynb (file_name=orders)
+       ├── Bronze_Layer.ipynb (file_name=customers)     ← parameterized, one notebook
+       └── Bronze_Layer.ipynb (file_name=products)         handles all datasets
+               │
+               ├── Silver_Customers.ipynb ┐
+               ├── Silver_Orders.ipynb    ├── parallel
+               ├── Silver_Products.ipynb  │
+               └── Silver_Regions.ipynb   ┘
+                       │
+                       ├── Gold_Customers.ipynb (SCD1)  ┐
+                       └── Gold Products.ipynb  (DLT SCD2) ┘ parallel
+                                      │
+                               Gold Orders.ipynb (Fact)  ← waits for both dims
+```
 
-## Repository Structure
+---
 
-- `parameters.ipynb`: Produces a list of datasets for orchestration via `dbutils.jobs.taskValues`
-- `Bronze_Layer.ipynb`: Parameterized streaming ingestion from `source` to `bronze`
-- `Silver_Customers.ipynb`: Cleansing and transformations for customers; writes Delta and registers Silver table
-- `Silver_Orders.ipynb`: Cleansing, window functions, writes Delta and registers Silver table
-- `Silver_Products.ipynb`: Cleansing, SQL/Python UDF examples, writes Delta and registers Silver table
-- `Silver_Regions.ipynb`: Reads from UC bronze table, writes Delta and registers Silver table
-- `Gold_Customers.ipynb`: Builds `gold.DimCustomers` with SCD Type 1 merge and `init_load_flag`
-- `Gold Products.ipynb`: DLT pipeline for `DimProducts` with expectations and SCD2 `apply_changes`
-- `Gold Orders.ipynb`: Builds `gold.FactOrders` and upserts via Delta MERGE
+## Key Design Decisions
 
+| Decision | Approach | Why |
+|----------|----------|-----|
+| **Bronze ingestion** | Auto Loader (`cloudFiles`) + `trigger(once=True)` | Supports schema evolution and checkpoint-based incremental file discovery; `trigger(once=True)` enables scheduled batch processing |
+| **Parameterized Bronze** | Single notebook + Databricks widgets + `taskValues` | One notebook handles N datasets — avoids code duplication |
+| **DimCustomers — SCD Type 1** | Manual Delta MERGE with surrogate key generation | Customer attributes (email, address) only need current state; explicit MERGE gives full control over new/existing record split |
+| **DimProducts — SCD Type 2** | DLT `apply_changes(stored_as_scd_type=2)` | Product price changes need full version history; DLT automates `__START_AT`/`__END_AT` lifecycle management |
+| **FactOrders optimization** | Column pruning → broadcast join → partitionBy(year) → Z-ORDER | Read less → shuffle less → prune partitions on time queries → skip files on customer lookups |
+| **Data governance** | Unity Catalog for all tables + UDFs | Centralized metadata, lineage, and access control across Bronze/Silver/Gold |
 
-## Data Locations (adjust if needed)
+---
 
-- Source Parquet (landing): `abfss://source@databricksstorage222.dfs.core.windows.net/<dataset>`
-- Bronze Streaming Output: `abfss://bronze@databricksstorage222.dfs.core.windows.net/<dataset>`
-- Silver Delta Paths:
-  - `customers`: `abfss://silver@databricksstorage222.dfs.core.windows.net/customers`
-  - `orders`: `abfss://silver@databricksstorage222.dfs.core.windows.net/orders`
-  - `products`: `abfss://silver@databricksstorage222.dfs.core.windows.net/products`
-  - `regions`: `abfss://silver@databricksstorage222.dfs.core.windows.net/regions`
-- Gold Delta Paths:
-  - `DimCustomers`: `abfss://gold@databricksstorage222.dfs.core.windows.net/Dimcustomers`
-  - `FactOrders`: `abfss://gold@databricksstorage222.dfs.core.windows.net/factorders`
+## Spark Optimizations (Gold Orders)
 
+| Technique | Implementation | Benefit |
+|-----------|---------------|---------|
+| **Column Pruning** | Explicit `SELECT` of 6 columns instead of `SELECT *` | Reduces I/O and shuffle volume |
+| **Broadcast Join** | `broadcast()` on DimCustomers and DimProducts | Eliminates shuffle of the large fact table |
+| **Partition Pruning** | `partitionBy("year")` on FactOrders | Year-based queries skip entire partitions |
+| **Z-ORDER** | `OPTIMIZE ... ZORDER BY (DimCustomerKey)` | Co-locates data for customer-level point lookups |
 
-## Unity Catalog Tables Created
+---
 
-- Silver:
-  - `databricks_catalog.silver.customers_silver`
-  - `databricks_catalog.silver.orders_silver`
-  - `databricks_catalog.silver.products_silver`
-  - `databricks_catalog.silver.regions_silver`
-- Gold:
-  - `databricks_catalog.gold.Dimcustomers`
-  - `databricks_catalog.gold.factorders`
-  - `Live.DimProducts` (within DLT pipeline), promoted as UC table when publishing DLT
+## Project Structure
 
+```
+├── parameters.ipynb          # Outputs dataset list via dbutils.jobs.taskValues
+├── Bronze_Layer.ipynb        # Parameterized Auto Loader ingestion (source → bronze)
+├── Silver_Customers.ipynb    # Email domain extraction, full_name composition
+├── Silver_Orders.ipynb       # Timestamp casting, year derivation, window functions
+├── Silver_Products.ipynb     # SQL UDF (discount) + Python UDF (uppercase) in UC
+├── Silver_Regions.ipynb      # Pass-through cleansing from UC bronze table
+├── Gold_Customers.ipynb      # SCD Type 1: dedup, new/old split, surrogate key, MERGE
+├── Gold Products.ipynb       # SCD Type 2: DLT expectations + apply_changes
+├── Gold Orders.ipynb         # Fact table: broadcast join, partition, Z-ORDER, MERGE
+├── datasets/                 # Source Parquet files (first + second batch)
+│   ├── customer_first.parquet
+│   ├── customers_second.parquet
+│   ├── orders_first.parquet
+│   ├── orders_second.parquet
+│   ├── products_first.parquet
+│   ├── products_second.parquet
+│   └── regions.parquet
+└── README.md
+```
 
-## Orchestration Overview
+---
 
-Typical end-to-end run order:
+## Tech Stack
 
-1) Run `parameters.ipynb`
-   - Outputs a task value `output_datasets` with `file_name`s: `orders`, `customers`, `products`.
-
-2) For each dataset, run `Bronze_Layer.ipynb` with widget `file_name`
-   - Widgets: `dbutils.widgets.text("file_name", "")`
-   - Streaming ingest from `abfss://source/.../<file_name>` to `abfss://bronze/.../<file_name>`
-   - Uses Auto Loader (`cloudFiles`) and `trigger(once=True)` to process available data
-
-3) Run Silver notebooks
-   - `Silver_Customers.ipynb`
-     - Drops `_rescued_data`, derives `domains` from `email`, composes `full_name`
-     - Writes Delta to Silver and creates `databricks_catalog.silver.customers_silver`
-   - `Silver_Orders.ipynb`
-     - Cleans schema, timestamps `order_date`, derives `year`
-     - Demonstrates window functions (`dense_rank`, `rank`, `row_number`)
-     - Writes Delta and creates `databricks_catalog.silver.orders_silver`
-   - `Silver_Products.ipynb`
-     - Drops `_rescued_data`, registers temp view `products`
-     - Demonstrates SQL UDF and Python UDF in UC schema `databricks_catalog.bronze`
-     - Adds `discount_price`, writes Delta and creates `databricks_catalog.silver.products_silver`
-   - `Silver_Regions.ipynb`
-     - Reads UC table `databricks_catalog.bronze.regions`, writes Delta and creates `databricks_catalog.silver.regions_silver`
-
-4) Run Gold dimension/fact
-   - `Gold_Customers.ipynb` (SCD Type 1)
-     - Widget: `init_load_flag` (0 = incremental from existing gold, 1 = initial full build)
-     - De-duplicates by `customer_id`
-     - Splits new vs. existing, maintains `create_date`/`update_date`, assigns surrogate `DimCustomerKey`
-     - Uses Delta MERGE into `databricks_catalog.gold.Dimcustomers`
-   - `Gold Products.ipynb` (DLT pipeline, SCD2)
-     - Defines expectations: `product_id IS NOT NULL`, `product_name IS NOT NULL`
-     - Ingests streaming from `databricks_catalog.silver.products_silver`
-     - Creates streaming view and uses `dlt.apply_changes` to build `DimProducts` as SCD2
-     - Deploy as a DLT pipeline with target catalog/schema
-   - `Gold Orders.ipynb` (Fact)
-     - Reads `silver.orders_silver`, joins to `gold.DimCustomers` and `gold.DimProducts`
-     - Drops natural keys, keeps surrogate keys (`DimCustomerKey`, `DimProductKey`)
-     - Upserts into `databricks_catalog.gold.factorders` using Delta MERGE
-
-
-## Running Locally in Databricks
-
-- Attach each notebook to a UC-enabled cluster with access to the ADLS Gen2 account and UC schemas.
-- Update any ABFSS paths if your storage account or container names differ from `databricksstorage222`.
-- Ensure the UC schemas `bronze`, `silver`, `gold` exist in `databricks_catalog`.
-
-Step-by-step:
-
-1) Open and run `parameters.ipynb`.
-2) Open `Bronze_Layer.ipynb`.
-   - Set widget `file_name` to one of: `orders`, `customers`, `products`.
-   - Run the notebook. Repeat for each dataset.
-3) Run `Silver_Customers.ipynb`, `Silver_Orders.ipynb`, `Silver_Products.ipynb`, `Silver_Regions.ipynb`.
-4) Run `Gold_Customers.ipynb`.
-   - Set `init_load_flag` to `1` for the first run, then `0` for subsequent incrementals.
-5) For products dimension, create and run a DLT pipeline using `Gold Products.ipynb`.
-6) Run `Gold Orders.ipynb` to maintain `factorders`.
-
-
-## Scheduling as Jobs
-
-Create a multi-task Databricks Job:
-
-- Task 1: `parameters.ipynb` → stores `output_datasets` in task values
-- Task 2..N: `Bronze_Layer.ipynb` (task-per-dataset)
-  - Pass `file_name` widget from the task values list
-  - Configure retry and trigger-Once cadence
-- Task: Silver notebooks (can run in parallel after Bronze completes)
-- Task: `Gold Products.ipynb` (DLT pipeline task)
-- Task: `Gold_Customers.ipynb` (ensure `init_load_flag` handling for initial run)
-- Task: `Gold Orders.ipynb`
-
-
-## Notable Implementation Details
-
-- Bronze uses Auto Loader with:
-  - `format("cloudFiles")`, `option("cloudFiles.format", "parquet")`
-  - Checkpoint and path per dataset: `checkpoint_<file_name>`
-- Silver tables are registered explicitly via SQL `CREATE TABLE ... USING DELTA LOCATION ...`
-- `Gold_Customers.ipynb`:
-  - SCD Type 1 into `gold.Dimcustomers` with surrogate keys using `monotonically_increasing_id()` plus max key offset
-  - Maintains `create_date`/`update_date` timestamps
-- `Gold Products.ipynb` (DLT): uses `@dlt.expect_all` and `dlt.apply_changes(... stored_as_scd_type=2)`
-- `Gold Orders.ipynb`: Upsert via `DeltaTable.forName(...).merge(...).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()`
-
-
-## Troubleshooting
-
-- Permission errors: Verify cluster has UC access and storage credentials to ABFSS paths.
-- Missing schemas/tables: Create `databricks_catalog.{bronze,silver,gold}` schemas before running.
-- Path mismatches: Update storage account/container names in notebooks to match your environment.
-- Auto Loader schema evolution: If schema drifts, update `schemaLocation` and consider options for evolution.
-- DLT pipeline errors: Ensure the DLT permissions, target UC settings, and that `Gold Products.ipynb` is used as the pipeline notebook.
+- **Azure Databricks** (DBR 13.x+) — Unified analytics platform
+- **ADLS Gen2** (ABFSS) — Cloud storage for all medallion layers
+- **Delta Lake** — ACID transactions, time travel, MERGE upserts
+- **Unity Catalog** — Centralized governance for tables, UDFs, and lineage
+- **Delta Live Tables (DLT)** — Declarative ETL with data quality expectations and SCD2
+- **Spark Structured Streaming** — Auto Loader with checkpoint-based incremental ingestion
+- **PySpark** — DataFrame transformations, window functions, UDFs
+- **Databricks Jobs** — Multi-task orchestration with parameterized notebooks and task values
